@@ -1,9 +1,16 @@
+import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const FamilyTreeApp());
 }
+
+/// Enum for Gender.
+enum Gender { male, female }
 
 /// The root widget.
 class FamilyTreeApp extends StatelessWidget {
@@ -22,17 +29,48 @@ class FamilyTreeApp extends StatelessWidget {
 /// Data model for a family member.
 class FamilyMember {
   final String id;
-  final String name;
+  String name;
+  Gender gender;
   final List<FamilyMember> spouses;
   final List<FamilyMember> children;
 
   FamilyMember({
     required this.id,
     required this.name,
+    this.gender = Gender.male,
     List<FamilyMember>? spouses,
     List<FamilyMember>? children,
   })  : spouses = spouses ?? [],
         children = children ?? [];
+
+  // Convert Gender to string.
+  String get genderAsString => gender == Gender.male ? "male" : "female";
+
+  // Convert this FamilyMember (and its subtree) to JSON.
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'name': name,
+      'gender': genderAsString,
+      'spouses': spouses.map((s) => s.toJson()).toList(),
+      'children': children.map((c) => c.toJson()).toList(),
+    };
+  }
+
+  // Create a FamilyMember from JSON.
+  static FamilyMember fromJson(Map<String, dynamic> json) {
+    return FamilyMember(
+      id: json['id'],
+      name: json['name'],
+      gender: json['gender'] == 'male' ? Gender.male : Gender.female,
+      spouses: (json['spouses'] as List<dynamic>)
+          .map((s) => FamilyMember.fromJson(s))
+          .toList(),
+      children: (json['children'] as List<dynamic>)
+          .map((c) => FamilyMember.fromJson(c))
+          .toList(),
+    );
+  }
 
   @override
   bool operator ==(Object other) =>
@@ -82,16 +120,20 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
 
   // Layout constants.
   final double nodeRadius = 25.0;
-  final double baseSpacing = 100.0; // Fixed slot width for an immediate node.
+  final double baseSpacing = 100.0; // fallback spacing for leaves
   final double verticalSpacing = 120.0;
-  final double branchGap = 50.0;
+  final double branchGap = 10.0;
 
-  // TransformationController for InteractiveViewer (if zooming/panning is desired)
+  // TransformationController for InteractiveViewer.
   final TransformationController _transformationController =
       TransformationController();
 
   // GlobalKey for our InteractiveViewer child.
   final GlobalKey _childKey = GlobalKey();
+
+  // Avatar images.
+  ui.Image? maleAvatar;
+  ui.Image? femaleAvatar;
 
   @override
   void initState() {
@@ -99,22 +141,46 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     // Start with a single node.
     root = FamilyMember(id: '1', name: 'Root');
     selectedMember = root;
+    _loadAvatars();
+    _loadTreeFromStorage(); // Try to load tree from local storage if exists.
   }
 
-  /// Returns the fixed immediate width for a node (and its spouse slots) on its parent's children row.
-  double immediateWidth(FamilyMember member) {
-    return baseSpacing;
+  /// Loads avatar images from assets.
+  Future<void> _loadAvatars() async {
+    final maleData = await rootBundle.load('assets/man.jpg');
+    final femaleData = await rootBundle.load('assets/women.jpg');
+    final maleImg = await decodeImageFromList(maleData.buffer.asUint8List());
+    final femaleImg =
+        await decodeImageFromList(femaleData.buffer.asUint8List());
+    setState(() {
+      maleAvatar = maleImg;
+      femaleAvatar = femaleImg;
+    });
+  }
+
+  /// Computes the required width for the subtree rooted at [member].
+  /// For leaves, returns [baseSpacing] as a minimum width.
+  double subtreeWidth(FamilyMember member,
+      {bool overrideSpouseLayout = false}) {
+    if (member.children.isEmpty) return baseSpacing;
+    double gap = branchGap;
+    List<double> slotWidths = [];
+    for (var child in member.children) {
+      slotWidths.add(subtreeWidth(child));
+      for (var spouse in child.spouses) {
+        slotWidths.add(subtreeWidth(spouse));
+      }
+    }
+    double total = slotWidths.fold(0.0, (prev, e) => prev + e) +
+        gap * (slotWidths.length - 1);
+    return total;
   }
 
   /// Recursively computes positions for each node.
-  ///
-  /// For a given parent, its immediate children (and any spouse slots) are spaced using a fixed width,
-  /// so that the parent's children row stays constant even if deeper subtrees grow wider.
+  /// The root is initially positioned at (screenWidth/2, 60).
   void computeLayout(FamilyMember member, double centerX, double y) {
-    // Set this node's position.
     positions[member] = Offset(centerX, y);
-
-    // Process spouse nodes (same y-level).
+    // Process spouse nodes.
     if (member.spouses.isNotEmpty) {
       for (int i = 0; i < member.spouses.length; i++) {
         FamilyMember spouse = member.spouses[i];
@@ -122,38 +188,31 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
         computeLayout(spouse, spouseX, y);
       }
     }
-
     // Process children.
     if (member.children.isNotEmpty) {
       double childY = y + verticalSpacing;
       List<EffectiveSlot> slots = [];
       List<double> slotWidths = [];
-
       for (var child in member.children) {
-        // Each child gets one slot.
         slots.add(EffectiveSlot(member: child, isSpouse: false));
-        slotWidths.add(immediateWidth(child));
-        // And each spouse of that child gets its own slot.
+        slotWidths.add(subtreeWidth(child));
         for (int i = 0; i < child.spouses.length; i++) {
           slots.add(
               EffectiveSlot(member: child, isSpouse: true, spouseIndex: i));
-          slotWidths.add(immediateWidth(child));
+          slotWidths.add(subtreeWidth(child.spouses[i]));
         }
       }
-
       int slotCount = slots.length;
       double gap = branchGap;
       double totalWidth =
           slotWidths.fold(0.0, (prev, e) => prev + e) + gap * (slotCount - 1);
-
-      // Use the parent's center or (if available) average with the first spouse.
       double connectorX = centerX;
       if (member.spouses.isNotEmpty &&
           positions.containsKey(member.spouses.first)) {
-        connectorX = (centerX + positions[member.spouses.first]!.dx) / 2;
+        final firstSpousePos = positions[member.spouses.first]!;
+        connectorX = (centerX + firstSpousePos.dx) / 2;
       }
       double startX = connectorX - totalWidth / 2;
-
       List<double> slotPositions = [];
       double currentX = startX;
       for (int i = 0; i < slotCount; i++) {
@@ -161,15 +220,11 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
         slotPositions.add(slotCenter);
         currentX += slotWidths[i] + gap;
       }
-
-      // Record the horizontal range for connecting children.
       effectiveRanges[member] =
           EffectiveRange(slotPositions.first, slotPositions.last);
-
-      // Recursively compute layout for each slot.
       for (int i = 0; i < slotCount; i++) {
-        double xPos = slotPositions[i];
         EffectiveSlot slot = slots[i];
+        double xPos = slotPositions[i];
         if (!slot.isSpouse) {
           computeLayout(slot.member, xPos, childY);
         } else {
@@ -180,11 +235,36 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     }
   }
 
+  /// Returns true if [member] is a main node (i.e. not added as a spouse).
+  bool isMainNode(FamilyMember member) {
+    if (member == root) return true;
+    return !_searchInSpouseLists(root, member);
+  }
+
+  bool _searchInSpouseLists(FamilyMember node, FamilyMember target) {
+    if (node.spouses.contains(target)) return true;
+    for (var child in node.children) {
+      if (_searchInSpouseLists(child, target)) return true;
+    }
+    return false;
+  }
+
+  /// Recursively finds the parent for which [target] is a spouse.
+  FamilyMember? getParentForSpouse(FamilyMember target, FamilyMember current) {
+    if (current.spouses.contains(target)) return current;
+    for (var child in current.children) {
+      var res = getParentForSpouse(target, child);
+      if (res != null) return res;
+    }
+    return null;
+  }
+
   /// Recursively finds a member by [id].
   FamilyMember? findMember(FamilyMember member, String id) {
     if (member.id == id) return member;
     for (var spouse in member.spouses) {
-      if (spouse.id == id) return spouse;
+      var found = findMember(spouse, id);
+      if (found != null) return found;
     }
     for (var child in member.children) {
       var found = findMember(child, id);
@@ -193,47 +273,78 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     return null;
   }
 
-  /// Adds a child to the member with [parentId].
+  /// Modified addChild: If the selected node is not a main node and is the first spouse,
+  /// then add the child to the main parent's children list so they share the same children.
   void addChild(String parentId, FamilyMember child) {
-    final parent = findMember(root, parentId);
-    if (parent != null) {
+    final FamilyMember? node = findMember(root, parentId);
+    if (node != null) {
+      if (!isMainNode(node)) {
+        FamilyMember? mainParent = getParentForSpouse(node, root);
+        if (mainParent != null &&
+            mainParent.spouses.isNotEmpty &&
+            mainParent.spouses[0] == node) {
+          setState(() {
+            mainParent.children.add(child);
+          });
+          return;
+        }
+      }
       setState(() {
-        parent.children.add(child);
+        node.children.add(child);
       });
     }
   }
 
-  /// Adds a spouse to the member with [memberId].
+  /// Adds a spouse to a member. Only main nodes can add spouses.
   void addSpouse(String memberId, FamilyMember spouse) {
     final member = findMember(root, memberId);
     if (member != null) {
-      setState(() {
-        member.spouses.add(spouse);
-      });
-    }
-  }
-
-  /// Returns a list of family members in the same drawing order.
-  /// (This order is used so that nodes drawn on top are hit-tested first.)
-  List<FamilyMember> getDrawingOrder(FamilyMember member) {
-    List<FamilyMember> order = [];
-    order.add(member);
-    if (member.spouses.isNotEmpty) {
-      for (var spouse in member.spouses) {
-        if (spouse.children.isNotEmpty) {
-          order.addAll(getDrawingOrder(spouse));
-        } else {
-          order.add(spouse);
-        }
+      if (isMainNode(member)) {
+        setState(() {
+          member.spouses.add(spouse);
+        });
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Only main nodes can add spouses.")),
+        );
       }
     }
-    for (var child in member.children) {
-      order.addAll(getDrawingOrder(child));
-    }
-    return order;
   }
 
-  /// Hit testing based on our computed positions.
+  /// --- JSON Serialization and Local Storage ---
+
+  String serializeTree() {
+    return jsonEncode(root.toJson());
+  }
+
+  void loadTree(String jsonString) {
+    Map<String, dynamic> map = jsonDecode(jsonString);
+    setState(() {
+      root = FamilyMember.fromJson(map);
+      selectedMember = root;
+    });
+  }
+
+  Future<void> _saveTree() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    await prefs.setString('family_tree', serializeTree());
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text("Family tree saved locally.")),
+    );
+  }
+
+  Future<void> _loadTreeFromStorage() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    String? jsonString = prefs.getString('family_tree');
+    if (jsonString != null) {
+      loadTree(jsonString);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Family tree loaded from local storage.")),
+      );
+    }
+  }
+
+  /// Hit testing based on computed positions.
   FamilyMember? _hitTest(Offset point) {
     List<FamilyMember> order = getDrawingOrder(root);
     for (var member in order.reversed) {
@@ -245,19 +356,300 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     return null;
   }
 
+  /// Returns a drawing order for hit testing.
+  List<FamilyMember> getDrawingOrder(FamilyMember member) {
+    List<FamilyMember> order = [member];
+    for (var spouse in member.spouses) {
+      order.add(spouse);
+    }
+    for (var spouse in member.spouses) {
+      order.addAll(getDrawingOrderForChildren(spouse));
+    }
+    order.addAll(getDrawingOrderForChildren(member));
+    return order;
+  }
+
+  List<FamilyMember> getDrawingOrderForChildren(FamilyMember member) {
+    List<FamilyMember> order = [];
+    for (var child in member.children) {
+      order.addAll(getDrawingOrder(child));
+    }
+    return order;
+  }
+
+  /// Shows a popup for a tapped node.
+  void _showNodePopup(FamilyMember node) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(node.name),
+          content: const Text("Choose an action:"),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _showAddChildDialog(node);
+              },
+              child: const Text("Add Child"),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _showAddSpouseDialog(node);
+              },
+              child: const Text("Add Spouse"),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _showEditDialog(node);
+              },
+              child: const Text("Edit Node"),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text("Cancel"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _showAddChildDialog(FamilyMember parent) {
+    Gender selectedGender = Gender.male;
+    showDialog(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(builder: (context, setState) {
+          return AlertDialog(
+            title: Text("Add Child to ${parent.name}"),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text("Select Gender for new Child:"),
+                Row(
+                  children: [
+                    Expanded(
+                      child: RadioListTile<Gender>(
+                        title: const Text("Male"),
+                        value: Gender.male,
+                        groupValue: selectedGender,
+                        onChanged: (value) {
+                          setState(() {
+                            selectedGender = value!;
+                          });
+                        },
+                      ),
+                    ),
+                    Expanded(
+                      child: RadioListTile<Gender>(
+                        title: const Text("Female"),
+                        value: Gender.female,
+                        groupValue: selectedGender,
+                        onChanged: (value) {
+                          setState(() {
+                            selectedGender = value!;
+                          });
+                        },
+                      ),
+                    ),
+                  ],
+                )
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  final newId =
+                      DateTime.now().millisecondsSinceEpoch.toString();
+                  addChild(
+                      parent.id,
+                      FamilyMember(
+                          id: newId, name: 'Child', gender: selectedGender));
+                  Navigator.of(context).pop();
+                },
+                child: const Text("Add Child"),
+              ),
+              TextButton(
+                onPressed: () {
+                  Navigator.of(context).pop();
+                },
+                child: const Text("Cancel"),
+              ),
+            ],
+          );
+        });
+      },
+    );
+  }
+
+  void _showAddSpouseDialog(FamilyMember member) {
+    if (!isMainNode(member)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Only main nodes can add spouses.")),
+      );
+      return;
+    }
+    Gender selectedGender = Gender.female;
+    showDialog(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(builder: (context, setState) {
+          return AlertDialog(
+            title: Text("Add Spouse to ${member.name}"),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text("Select Gender for new Spouse:"),
+                Row(
+                  children: [
+                    Expanded(
+                      child: RadioListTile<Gender>(
+                        title: const Text("Male"),
+                        value: Gender.male,
+                        groupValue: selectedGender,
+                        onChanged: (value) {
+                          setState(() {
+                            selectedGender = value!;
+                          });
+                        },
+                      ),
+                    ),
+                    Expanded(
+                      child: RadioListTile<Gender>(
+                        title: const Text("Female"),
+                        value: Gender.female,
+                        groupValue: selectedGender,
+                        onChanged: (value) {
+                          setState(() {
+                            selectedGender = value!;
+                          });
+                        },
+                      ),
+                    ),
+                  ],
+                )
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  final newId =
+                      DateTime.now().millisecondsSinceEpoch.toString();
+                  addSpouse(
+                      member.id,
+                      FamilyMember(
+                          id: newId, name: 'Spouse', gender: selectedGender));
+                  Navigator.of(context).pop();
+                },
+                child: const Text("Add Spouse"),
+              ),
+              TextButton(
+                onPressed: () {
+                  Navigator.of(context).pop();
+                },
+                child: const Text("Cancel"),
+              ),
+            ],
+          );
+        });
+      },
+    );
+  }
+
+  void _showEditDialog(FamilyMember node) {
+    final TextEditingController nameController =
+        TextEditingController(text: node.name);
+    Gender selectedGender = node.gender;
+    showDialog(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(builder: (context, setState) {
+          return AlertDialog(
+            title: const Text("Edit Node"),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: nameController,
+                  decoration: const InputDecoration(labelText: "Name"),
+                ),
+                const SizedBox(height: 16),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ListTile(
+                        title: const Text("Male"),
+                        leading: Radio<Gender>(
+                          value: Gender.male,
+                          groupValue: selectedGender,
+                          onChanged: (value) {
+                            setState(() {
+                              selectedGender = value!;
+                            });
+                          },
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: ListTile(
+                        title: const Text("Female"),
+                        leading: Radio<Gender>(
+                          value: Gender.female,
+                          groupValue: selectedGender,
+                          onChanged: (value) {
+                            setState(() {
+                              selectedGender = value!;
+                            });
+                          },
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  setState(() {
+                    node.name = nameController.text;
+                    node.gender = selectedGender;
+                  });
+                  Navigator.of(context).pop();
+                  setState(() {}); // Refresh tree.
+                },
+                child: const Text("Save"),
+              ),
+              TextButton(
+                onPressed: () {
+                  Navigator.of(context).pop();
+                },
+                child: const Text("Cancel"),
+              ),
+            ],
+          );
+        });
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    // Clear previous positions.
     positions.clear();
     effectiveRanges.clear();
     final screenSize = MediaQuery.of(context).size;
     final screenWidth = screenSize.width;
-    final screenHeight = screenSize.height;
-
-    // Compute layout starting at the top-center.
+    // Compute layout with the root at (screenWidth/2, 60)
     computeLayout(root, screenWidth / 2, 60);
-
-    // --- Compute bounding box for the tree (with safe margin) ---
+    // Compute bounding box.
     double minX = double.infinity, minY = double.infinity;
     double maxX = -double.infinity, maxY = -double.infinity;
     for (var pos in positions.values) {
@@ -267,34 +659,33 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
       if (pos.dy > maxY) maxY = pos.dy;
     }
     const double safeMargin = 100.0;
-    final shift = Offset(safeMargin - minX, safeMargin - minY);
-    positions.updateAll((member, pos) => pos + shift);
-    effectiveRanges.updateAll((member, range) =>
-        EffectiveRange(range.left + shift.dx, range.right + shift.dx));
-
-    final computedWidth = (maxX - minX) + safeMargin * 2;
-    final computedHeight = (maxY - minY) + safeMargin * 2;
-
-    // Use full available width and height if computed dimensions are smaller.
-    final canvasWidth = math.max(computedWidth, screenWidth);
-    final canvasHeight = math.max(computedHeight, screenHeight);
-
-    // If extra space is available, center the tree.
-    final extraShift = Offset(
-        (canvasWidth - computedWidth) / 2, (canvasHeight - computedHeight) / 2);
-    positions.updateAll((member, pos) => pos + extraShift);
-    effectiveRanges.updateAll((member, range) => EffectiveRange(
-        range.left + extraShift.dx, range.right + extraShift.dx));
+    final canvasWidth = (maxX - minX) + safeMargin * 2;
+    final canvasHeight = (maxY - minY) + safeMargin * 2;
 
     return Scaffold(
-      appBar: AppBar(title: const Text("Dynamic Family Tree")),
+      appBar: AppBar(
+        title: const Text("Dynamic Family Tree"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.save),
+            onPressed: _saveTree,
+            tooltip: "Save Tree",
+          ),
+          IconButton(
+            icon: const Icon(Icons.download),
+            onPressed: _loadTreeFromStorage,
+            tooltip: "Load Tree",
+          ),
+        ],
+      ),
       body: Container(
         color: const Color(0xFFF5F3E5),
         child: Stack(
           children: [
             InteractiveViewer(
+              constrained: false,
               transformationController: _transformationController,
-              boundaryMargin: const EdgeInsets.all(1000),
+              boundaryMargin: const EdgeInsets.all(3000),
               minScale: 0.1,
               maxScale: 5.0,
               child: SizedBox(
@@ -309,11 +700,12 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
                     effectiveRanges: effectiveRanges,
                     nodeRadius: nodeRadius,
                     selectedMember: selectedMember,
+                    maleAvatar: maleAvatar,
+                    femaleAvatar: femaleAvatar,
                   ),
                 ),
               ),
             ),
-            // Top-level GestureDetector to convert global taps.
             Positioned.fill(
               child: GestureDetector(
                 behavior: HitTestBehavior.translucent,
@@ -327,6 +719,7 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
                     setState(() {
                       selectedMember = tappedMember;
                     });
+                    _showNodePopup(tappedMember);
                   }
                 },
               ),
@@ -341,9 +734,7 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
             heroTag: "child",
             onPressed: () {
               if (selectedMember != null) {
-                final newId = DateTime.now().millisecondsSinceEpoch.toString();
-                addChild(
-                    selectedMember!.id, FamilyMember(id: newId, name: 'Child'));
+                _showAddChildDialog(selectedMember!);
               } else {
                 ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(content: Text("No node selected")));
@@ -357,9 +748,7 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
             heroTag: "spouse",
             onPressed: () {
               if (selectedMember != null) {
-                final newId = DateTime.now().millisecondsSinceEpoch.toString();
-                addSpouse(selectedMember!.id,
-                    FamilyMember(id: newId, name: 'Spouse'));
+                _showAddSpouseDialog(selectedMember!);
               } else {
                 ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(content: Text("No node selected")));
@@ -381,6 +770,8 @@ class FamilyTreePainter extends CustomPainter {
   final Map<FamilyMember, EffectiveRange> effectiveRanges;
   final double nodeRadius;
   final FamilyMember? selectedMember;
+  final ui.Image? maleAvatar;
+  final ui.Image? femaleAvatar;
 
   FamilyTreePainter({
     required this.root,
@@ -388,6 +779,8 @@ class FamilyTreePainter extends CustomPainter {
     required this.effectiveRanges,
     required this.nodeRadius,
     this.selectedMember,
+    this.maleAvatar,
+    this.femaleAvatar,
   });
 
   final Paint linePaint = Paint()
@@ -401,9 +794,9 @@ class FamilyTreePainter extends CustomPainter {
     _drawNodes(canvas, root);
   }
 
-  void _drawConnectors(Canvas canvas, FamilyMember member) {
-    final Offset? pos = positions[member];
-    if (pos == null) return;
+  void _drawConnectors(Canvas canvas, FamilyMember member,
+      {Offset? connectorOrigin}) {
+    final Offset nodeOrigin = connectorOrigin ?? positions[member]!;
 
     // Draw spouse connectors.
     if (member.spouses.isNotEmpty) {
@@ -412,37 +805,42 @@ class FamilyTreePainter extends CustomPainter {
         final spousePos = positions[spouse];
         if (spousePos != null) {
           double offsetY = 4.0 * i;
-          final Offset start = Offset(pos.dx + nodeRadius, pos.dy - offsetY);
+          final Offset start =
+              Offset(nodeOrigin.dx + nodeRadius, nodeOrigin.dy - offsetY);
           final Offset end =
               Offset(spousePos.dx - nodeRadius, spousePos.dy - offsetY);
           canvas.drawLine(start, end, linePaint);
+          late Offset spouseConnectorOrigin;
           if (i == 0) {
-            final Offset midpoint =
+            spouseConnectorOrigin =
                 Offset((start.dx + end.dx) / 2, (start.dy + end.dy) / 2);
-            _drawLinkIcon(canvas, midpoint, linePaint.color);
+            _drawLinkIcon(canvas, spouseConnectorOrigin, linePaint.color);
           } else {
-            final Offset iconPos =
+            spouseConnectorOrigin =
                 Offset(spousePos.dx - nodeRadius - 30, spousePos.dy - offsetY);
-            _drawLinkIcon(canvas, iconPos, linePaint.color);
+            _drawLinkIcon(canvas, spouseConnectorOrigin, linePaint.color);
           }
+          _drawConnectors(canvas, spouse,
+              connectorOrigin: spouseConnectorOrigin);
         }
       }
     }
 
-    // Draw connectors for children.
+    // Draw children connectors.
     if (member.children.isNotEmpty) {
-      Offset connector = pos;
-      if (member.spouses.isNotEmpty &&
+      final Offset baseConnector;
+      if (connectorOrigin == null &&
+          member.spouses.isNotEmpty &&
           positions.containsKey(member.spouses.first)) {
         final firstSpousePos = positions[member.spouses.first]!;
-        connector = Offset(
-            (pos.dx + firstSpousePos.dx) / 2, (pos.dy + firstSpousePos.dy) / 2);
+        baseConnector = Offset((positions[member]!.dx + firstSpousePos.dx) / 2,
+            (positions[member]!.dy + firstSpousePos.dy) / 2);
+      } else {
+        baseConnector = nodeOrigin;
       }
-
       const double stubLength = 12;
       double childCenterY = positions[member.children.first]!.dy;
       double childConnectorY = childCenterY - nodeRadius - stubLength;
-
       double leftX, rightX;
       if (effectiveRanges.containsKey(member)) {
         final range = effectiveRanges[member]!;
@@ -452,26 +850,21 @@ class FamilyTreePainter extends CustomPainter {
         leftX = positions[member.children.first]!.dx;
         rightX = positions[member.children.last]!.dx;
       }
-
-      double joinX = connector.dx;
+      double joinX = baseConnector.dx;
       if (joinX < leftX)
         joinX = leftX;
       else if (joinX > rightX) joinX = rightX;
       Offset joinPoint = Offset(joinX, childConnectorY);
-
-      if (connector.dx == joinX) {
-        canvas.drawLine(connector, joinPoint, linePaint);
-        canvas.drawCircle(joinPoint, 3.0, Paint()..color = linePaint.color);
+      if (baseConnector.dx == joinX) {
+        canvas.drawLine(baseConnector, joinPoint, linePaint);
       } else {
         double midY = childConnectorY - stubLength;
-        canvas.drawLine(connector, Offset(connector.dx, midY), linePaint);
         canvas.drawLine(
-            Offset(connector.dx, midY), Offset(joinX, midY), linePaint);
+            baseConnector, Offset(baseConnector.dx, midY), linePaint);
+        canvas.drawLine(
+            Offset(baseConnector.dx, midY), Offset(joinX, midY), linePaint);
         canvas.drawLine(Offset(joinX, midY), joinPoint, linePaint);
-        canvas.drawCircle(
-            Offset(joinX, midY), 3.0, Paint()..color = linePaint.color);
       }
-
       canvas.drawLine(Offset(leftX, childConnectorY),
           Offset(rightX, childConnectorY), linePaint);
       for (var child in member.children) {
@@ -481,24 +874,16 @@ class FamilyTreePainter extends CustomPainter {
             Offset(childPos.dx, childConnectorY), avatarTop, linePaint);
       }
     }
-
     for (var child in member.children) {
       _drawConnectors(canvas, child);
-    }
-    if (member.spouses.isNotEmpty) {
-      for (var spouse in member.spouses) {
-        if (spouse.children.isNotEmpty) {
-          _drawConnectors(canvas, spouse);
-        }
-      }
     }
   }
 
   void _drawNodes(Canvas canvas, FamilyMember member) {
     final Offset? pos = positions[member];
     if (pos == null) return;
-    _drawAvatar(canvas, pos, member.name, member == selectedMember);
-
+    _drawAvatar(
+        canvas, pos, member.name, member == selectedMember, member.gender);
     if (member.spouses.isNotEmpty) {
       for (var spouse in member.spouses) {
         if (spouse.children.isNotEmpty) {
@@ -506,8 +891,8 @@ class FamilyTreePainter extends CustomPainter {
         } else {
           final spousePos = positions[spouse];
           if (spousePos != null) {
-            _drawAvatar(
-                canvas, spousePos, spouse.name, spouse == selectedMember);
+            _drawAvatar(canvas, spousePos, spouse.name,
+                spouse == selectedMember, spouse.gender);
           }
         }
       }
@@ -521,7 +906,6 @@ class FamilyTreePainter extends CustomPainter {
     const double iconBgRadius = 12.0;
     final Paint bgPaint = Paint()..color = backgroundColor;
     canvas.drawCircle(center, iconBgRadius, bgPaint);
-
     final TextSpan textSpan = TextSpan(
       text: String.fromCharCode(Icons.link.codePoint),
       style: TextStyle(
@@ -541,11 +925,10 @@ class FamilyTreePainter extends CustomPainter {
     textPainter.paint(canvas, iconOffset);
   }
 
-  void _drawAvatar(
-      Canvas canvas, Offset center, String label, bool isSelected) {
-    final Paint circlePaint = Paint()..color = const Color(0xFFCBCBCB);
-    canvas.drawCircle(center, nodeRadius, circlePaint);
-
+  void _drawAvatar(Canvas canvas, Offset center, String label, bool isSelected,
+      Gender gender) {
+    final Paint bgPaint = Paint()..color = Colors.white;
+    canvas.drawCircle(center, nodeRadius, bgPaint);
     if (isSelected) {
       final Paint borderPaint = Paint()
         ..color = Colors.red
@@ -553,20 +936,63 @@ class FamilyTreePainter extends CustomPainter {
         ..strokeWidth = 3;
       canvas.drawCircle(center, nodeRadius + 2, borderPaint);
     }
-
-    final TextSpan span = TextSpan(
+    ui.Image? avatarImage;
+    if (gender == Gender.male && maleAvatar != null) {
+      avatarImage = maleAvatar;
+    } else if (gender == Gender.female && femaleAvatar != null) {
+      avatarImage = femaleAvatar;
+    }
+    if (avatarImage != null) {
+      final Rect dstRect = Rect.fromCenter(
+          center: center, width: nodeRadius * 2, height: nodeRadius * 2);
+      canvas.save();
+      canvas.clipPath(Path()..addOval(dstRect));
+      final Rect srcRect = Rect.fromLTWH(
+          0, 0, avatarImage.width.toDouble(), avatarImage.height.toDouble());
+      canvas.drawImageRect(avatarImage, srcRect, dstRect, Paint());
+      canvas.restore();
+    } else {
+      IconData iconData;
+      Color iconColor;
+      if (gender == Gender.male) {
+        iconData = Icons.male;
+        iconColor = Colors.blue;
+      } else {
+        iconData = Icons.female;
+        iconColor = Colors.pink;
+      }
+      final TextSpan iconSpan = TextSpan(
+        text: String.fromCharCode(iconData.codePoint),
+        style: TextStyle(
+          fontFamily: iconData.fontFamily,
+          package: iconData.fontPackage,
+          fontSize: 20,
+          color: iconColor,
+        ),
+      );
+      final TextPainter iconPainter = TextPainter(
+        text: iconSpan,
+        textAlign: TextAlign.center,
+        textDirection: TextDirection.ltr,
+      );
+      iconPainter.layout();
+      final Offset iconOffset = Offset(center.dx - iconPainter.width / 2,
+          center.dy - iconPainter.height / 2);
+      iconPainter.paint(canvas, iconOffset);
+    }
+    final TextSpan labelSpan = TextSpan(
       text: label,
-      style: const TextStyle(color: Colors.black, fontSize: 10),
+      style: const TextStyle(color: Colors.black, fontSize: 8),
     );
-    final TextPainter tp = TextPainter(
-      text: span,
+    final TextPainter labelPainter = TextPainter(
+      text: labelSpan,
       textAlign: TextAlign.center,
       textDirection: TextDirection.ltr,
     );
-    tp.layout(minWidth: 0, maxWidth: nodeRadius * 2);
-    final Offset textOffset =
-        Offset(center.dx - tp.width / 2, center.dy - tp.height / 2);
-    tp.paint(canvas, textOffset);
+    labelPainter.layout();
+    final Offset labelOffset =
+        Offset(center.dx - labelPainter.width / 2, center.dy + nodeRadius + 2);
+    labelPainter.paint(canvas, labelOffset);
   }
 
   @override
