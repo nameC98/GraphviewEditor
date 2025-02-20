@@ -33,6 +33,8 @@ class FamilyMember {
   Gender gender;
   final List<FamilyMember> spouses;
   final List<FamilyMember> children;
+  // NEW: List of parents for added spouses.
+  final List<FamilyMember> parents;
 
   FamilyMember({
     required this.id,
@@ -40,13 +42,15 @@ class FamilyMember {
     this.gender = Gender.male,
     List<FamilyMember>? spouses,
     List<FamilyMember>? children,
+    List<FamilyMember>? parents,
   })  : spouses = spouses ?? [],
-        children = children ?? [];
+        children = children ?? [],
+        parents = parents ?? [];
 
-  // Convert Gender to string.
+  // Convert gender to string.
   String get genderAsString => gender == Gender.male ? "male" : "female";
 
-  // Convert this FamilyMember (and its subtree) to JSON.
+  // JSON serialization.
   Map<String, dynamic> toJson() {
     return {
       'id': id,
@@ -54,10 +58,11 @@ class FamilyMember {
       'gender': genderAsString,
       'spouses': spouses.map((s) => s.toJson()).toList(),
       'children': children.map((c) => c.toJson()).toList(),
+      'parents': parents.map((p) => p.toJson()).toList(),
     };
   }
 
-  // Create a FamilyMember from JSON.
+  // JSON deserialization.
   static FamilyMember fromJson(Map<String, dynamic> json) {
     return FamilyMember(
       id: json['id'],
@@ -69,6 +74,11 @@ class FamilyMember {
       children: (json['children'] as List<dynamic>)
           .map((c) => FamilyMember.fromJson(c))
           .toList(),
+      parents: json.containsKey('parents')
+          ? (json['parents'] as List<dynamic>)
+              .map((p) => FamilyMember.fromJson(p))
+              .toList()
+          : [],
     );
   }
 
@@ -142,7 +152,7 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     root = FamilyMember(id: '1', name: 'Root');
     selectedMember = root;
     _loadAvatars();
-    _loadTreeFromStorage(); // Try to load tree from local storage if exists.
+    _loadTreeFromStorage();
   }
 
   /// Loads avatar images from assets.
@@ -159,7 +169,6 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
   }
 
   /// Computes the required width for the subtree rooted at [member].
-  /// For leaves, returns [baseSpacing] as a minimum width.
   double subtreeWidth(FamilyMember member,
       {bool overrideSpouseLayout = false}) {
     if (member.children.isEmpty) return baseSpacing;
@@ -177,10 +186,9 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
   }
 
   /// Recursively computes positions for each node.
-  /// The root is initially positioned at (screenWidth/2, 60).
+  /// The root is positioned at (screenWidth/2, 60).
   void computeLayout(FamilyMember member, double centerX, double y) {
     positions[member] = Offset(centerX, y);
-    // Process spouse nodes.
     if (member.spouses.isNotEmpty) {
       for (int i = 0; i < member.spouses.length; i++) {
         FamilyMember spouse = member.spouses[i];
@@ -188,7 +196,6 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
         computeLayout(spouse, spouseX, y);
       }
     }
-    // Process children.
     if (member.children.isNotEmpty) {
       double childY = y + verticalSpacing;
       List<EffectiveSlot> slots = [];
@@ -273,8 +280,8 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     return null;
   }
 
-  /// Modified addChild: If the selected node is not a main node and is the first spouse,
-  /// then add the child to the main parent's children list so they share the same children.
+  /// Modified addChild: if the selected node is not a main node and is the first spouse,
+  /// add the child to the parent's children list (shared between main node and first spouse).
   void addChild(String parentId, FamilyMember child) {
     final FamilyMember? node = findMember(root, parentId);
     if (node != null) {
@@ -295,7 +302,7 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     }
   }
 
-  /// Adds a spouse to a member. Only main nodes can add spouses.
+  /// Adds a spouse only to main nodes.
   void addSpouse(String memberId, FamilyMember spouse) {
     final member = findMember(root, memberId);
     if (member != null) {
@@ -311,8 +318,23 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     }
   }
 
-  /// --- JSON Serialization and Local Storage ---
+  /// NEW: Adds a parent to a node (only allowed for non‑main nodes).
+  void addParent(String memberId, FamilyMember parent) {
+    final member = findMember(root, memberId);
+    if (member != null) {
+      if (!isMainNode(member)) {
+        setState(() {
+          member.parents.add(parent);
+        });
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Cannot add parent to a main node.")),
+        );
+      }
+    }
+  }
 
+  /// --- JSON Serialization and Local Storage ---
   String serializeTree() {
     return jsonEncode(root.toJson());
   }
@@ -344,10 +366,31 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     }
   }
 
+  /// Helper method to determine if a given node is a parent node.
+  bool isParentNode(FamilyMember target) {
+    bool found = false;
+    void search(FamilyMember member) {
+      if (member.parents.contains(target)) {
+        found = true;
+        return;
+      }
+      for (var spouse in member.spouses) {
+        search(spouse);
+        if (found) return;
+      }
+      for (var child in member.children) {
+        search(child);
+        if (found) return;
+      }
+    }
+
+    search(root);
+    return found;
+  }
+
   /// Hit testing based on computed positions.
   FamilyMember? _hitTest(Offset point) {
-    List<FamilyMember> order = getDrawingOrder(root);
-    for (var member in order.reversed) {
+    for (var member in positions.keys.toList().reversed) {
       final pos = positions[member];
       if (pos != null && (pos - point).distance <= nodeRadius) {
         return member;
@@ -389,13 +432,14 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
             borderRadius: BorderRadius.circular(16),
           ),
           actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                _showAddChildDialog(node);
-              },
-              child: const Text("Add Child"),
-            ),
+            if (!isParentNode(node))
+              TextButton(
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  _showAddChildDialog(node);
+                },
+                child: const Text("Add Child"),
+              ),
             TextButton(
               onPressed: () {
                 Navigator.of(context).pop();
@@ -403,6 +447,14 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
               },
               child: const Text("Add Spouse"),
             ),
+            if (!isMainNode(node))
+              TextButton(
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  _showAddParentDialog(node);
+                },
+                child: const Text("Add Parents"),
+              ),
             TextButton(
               onPressed: () {
                 Navigator.of(context).pop();
@@ -564,6 +616,70 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     );
   }
 
+  // NEW: Dialog to add Parents (a male and a female) to a non‑main (spouse) node.
+  void _showAddParentDialog(FamilyMember node) {
+    final TextEditingController maleController =
+        TextEditingController(text: 'Male Parent');
+    final TextEditingController femaleController =
+        TextEditingController(text: 'Female Parent');
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text("Add Parents to ${node.name}"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: maleController,
+                decoration:
+                    const InputDecoration(labelText: "Male Parent Name"),
+              ),
+              TextField(
+                controller: femaleController,
+                decoration:
+                    const InputDecoration(labelText: "Female Parent Name"),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                final newIdMale =
+                    DateTime.now().millisecondsSinceEpoch.toString() + "m";
+                final newIdFemale =
+                    DateTime.now().millisecondsSinceEpoch.toString() + "f";
+                addParent(
+                    node.id,
+                    FamilyMember(
+                        id: newIdMale,
+                        name: maleController.text,
+                        gender: Gender.male));
+                addParent(
+                    node.id,
+                    FamilyMember(
+                        id: newIdFemale,
+                        name: femaleController.text,
+                        gender: Gender.female));
+                Navigator.of(context).pop();
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  setState(() {});
+                });
+              },
+              child: const Text("Add Parents"),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text("Cancel"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   void _showEditDialog(FamilyMember node) {
     final TextEditingController nameController =
         TextEditingController(text: node.name);
@@ -641,15 +757,54 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
     );
   }
 
+  /// getZoomedNodes returns a pair [mainParent, selectedSpouse] if the selected node is non‑main.
+  List<FamilyMember>? getZoomedNodes() {
+    if (selectedMember != null && !isMainNode(selectedMember!)) {
+      FamilyMember? mainParent = getParentForSpouse(selectedMember!, root);
+      if (mainParent != null) {
+        return [mainParent, selectedMember!];
+      }
+    }
+    return null;
+  }
+
   @override
   Widget build(BuildContext context) {
     positions.clear();
     effectiveRanges.clear();
     final screenSize = MediaQuery.of(context).size;
     final screenWidth = screenSize.width;
-    // Compute layout with the root at (screenWidth/2, 60)
+    // Compute layout with root at (screenWidth/2, 60)
     computeLayout(root, screenWidth / 2, 60);
-    // Compute bounding box.
+
+    // Zoom mode: if an added spouse is selected, use zoom mode.
+    List<FamilyMember>? zoomedNodes = getZoomedNodes();
+    if (zoomedNodes != null) {
+      FamilyMember zoomSpouse = zoomedNodes[1];
+      if (zoomSpouse.parents.length == 2 && positions.containsKey(zoomSpouse)) {
+        Offset spousePos = positions[zoomSpouse]!;
+        double parentY = spousePos.dy - 100; // increased vertical gap
+        double spacing = 120; // increased horizontal spacing between parents
+        Offset leftParentPos = Offset(spousePos.dx - spacing / 2, parentY);
+        Offset rightParentPos = Offset(spousePos.dx + spacing / 2, parentY);
+        // Draw avatars for both parents
+        positions[zoomSpouse.parents[0]] = leftParentPos;
+        positions[zoomSpouse.parents[1]] = rightParentPos;
+      } else if (zoomSpouse.parents.isNotEmpty &&
+          positions.containsKey(zoomSpouse)) {
+        Offset spousePos = positions[zoomSpouse]!;
+        double parentY = spousePos.dy - 60;
+        int count = zoomSpouse.parents.length;
+        double spacing = 40;
+        double totalWidth = (count - 1) * spacing;
+        double startX = spousePos.dx - totalWidth / 2;
+        for (int i = 0; i < count; i++) {
+          positions[zoomSpouse.parents[i]] =
+              Offset(startX + i * spacing, parentY);
+        }
+      }
+    }
+
     double minX = double.infinity, minY = double.infinity;
     double maxX = -double.infinity, maxY = -double.infinity;
     for (var pos in positions.values) {
@@ -702,6 +857,7 @@ class _FamilyTreeWidgetState extends State<FamilyTreeWidget> {
                     selectedMember: selectedMember,
                     maleAvatar: maleAvatar,
                     femaleAvatar: femaleAvatar,
+                    zoomedNodes: zoomedNodes,
                   ),
                 ),
               ),
@@ -772,6 +928,7 @@ class FamilyTreePainter extends CustomPainter {
   final FamilyMember? selectedMember;
   final ui.Image? maleAvatar;
   final ui.Image? femaleAvatar;
+  final List<FamilyMember>? zoomedNodes;
 
   FamilyTreePainter({
     required this.root,
@@ -781,6 +938,7 @@ class FamilyTreePainter extends CustomPainter {
     this.selectedMember,
     this.maleAvatar,
     this.femaleAvatar,
+    this.zoomedNodes,
   });
 
   final Paint linePaint = Paint()
@@ -790,15 +948,124 @@ class FamilyTreePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    _drawConnectors(canvas, root);
-    _drawNodes(canvas, root);
+    if (zoomedNodes != null) {
+      _drawZoomMode(canvas, zoomedNodes![0], zoomedNodes![1]);
+    } else {
+      _drawConnectors(canvas, root);
+      _drawNodes(canvas, root, <FamilyMember>{});
+    }
+  }
+
+  void _drawZoomMode(
+      Canvas canvas, FamilyMember zoomMain, FamilyMember zoomSpouse) {
+    _drawAvatar(canvas, positions[zoomMain]!, zoomMain.name,
+        zoomMain == selectedMember, zoomMain.gender);
+    if (zoomMain.spouses.contains(zoomSpouse)) {
+      Offset spousePos = positions[zoomSpouse]!;
+      double offsetY = 4.0 * zoomMain.spouses.indexOf(zoomSpouse);
+      final Offset start = Offset(positions[zoomMain]!.dx + nodeRadius,
+          positions[zoomMain]!.dy - offsetY);
+      final Offset end =
+          Offset(spousePos.dx - nodeRadius, spousePos.dy - offsetY);
+      canvas.drawLine(start, end, linePaint);
+      Offset linkIcon =
+          Offset((start.dx + end.dx) / 2, (start.dy + end.dy) / 2);
+      _drawLinkIcon(canvas, linkIcon, linePaint.color);
+      _drawAvatar(canvas, spousePos, zoomSpouse.name,
+          zoomSpouse == selectedMember, zoomSpouse.gender);
+      if (zoomSpouse.parents.length == 2) {
+        // New drawing logic for paired parents with increased horizontal spacing
+        double parentY = spousePos.dy - 100; // increased vertical gap
+        double spacing = 120; // increased horizontal spacing between parents
+        Offset leftParentPos = Offset(spousePos.dx - spacing / 2, parentY);
+        Offset rightParentPos = Offset(spousePos.dx + spacing / 2, parentY);
+        // Draw avatars for both parents
+        _drawAvatar(canvas, leftParentPos, zoomSpouse.parents[0].name, false,
+            zoomSpouse.parents[0].gender);
+        _drawAvatar(canvas, rightParentPos, zoomSpouse.parents[1].name, false,
+            zoomSpouse.parents[1].gender);
+        // Draw horizontal line connecting the two parent's avatars
+        Offset leftEdge =
+            Offset(leftParentPos.dx + nodeRadius, leftParentPos.dy);
+        Offset rightEdge =
+            Offset(rightParentPos.dx - nodeRadius, rightParentPos.dy);
+        canvas.drawLine(leftEdge, rightEdge, linePaint);
+        // Draw link icon at the midpoint of the horizontal line
+        Offset midPoint = Offset((leftEdge.dx + rightEdge.dx) / 2, leftEdge.dy);
+        _drawLinkIcon(canvas, midPoint, linePaint.color);
+        // Draw vertical line from the midpoint to the spouse's top
+        Offset spouseTop = Offset(spousePos.dx, spousePos.dy - nodeRadius);
+        canvas.drawLine(midPoint, spouseTop, linePaint);
+      } else if (zoomSpouse.parents.isNotEmpty) {
+        double parentY = spousePos.dy - 60;
+        int count = zoomSpouse.parents.length;
+        double spacing = 40;
+        double totalWidth = (count - 1) * spacing;
+        double startX = spousePos.dx - totalWidth / 2;
+        for (int i = 0; i < count; i++) {
+          Offset parentPos = Offset(startX + i * spacing, parentY);
+          _drawAvatar(canvas, parentPos, zoomSpouse.parents[i].name, false,
+              zoomSpouse.parents[i].gender);
+          final Offset parentBottom =
+              Offset(parentPos.dx, parentPos.dy + nodeRadius);
+          final Offset spouseTop =
+              Offset(spousePos.dx, spousePos.dy - nodeRadius);
+          canvas.drawLine(parentBottom, spouseTop, linePaint);
+        }
+      }
+      if (zoomMain.children.isNotEmpty) {
+        _drawChildrenConnectors(canvas, zoomMain,
+            baseConnectorOverride: linkIcon);
+        for (var child in zoomMain.children) {
+          _drawConnectors(canvas, child);
+          _drawNodes(canvas, child, <FamilyMember>{});
+        }
+      }
+    }
+  }
+
+  void _drawChildrenConnectors(Canvas canvas, FamilyMember member,
+      {Offset? baseConnectorOverride}) {
+    final Offset baseConnector = baseConnectorOverride ?? positions[member]!;
+    const double stubLength = 12;
+    double childCenterY = positions[member.children.first]!.dy;
+    double childConnectorY = childCenterY - nodeRadius - stubLength;
+    double leftX, rightX;
+    if (effectiveRanges.containsKey(member)) {
+      final range = effectiveRanges[member]!;
+      leftX = range.left;
+      rightX = range.right;
+    } else {
+      leftX = positions[member.children.first]!.dx;
+      rightX = positions[member.children.last]!.dx;
+    }
+    double joinX = baseConnector.dx;
+    if (joinX < leftX)
+      joinX = leftX;
+    else if (joinX > rightX) joinX = rightX;
+    Offset joinPoint = Offset(joinX, childConnectorY);
+    if (baseConnector.dx == joinX) {
+      canvas.drawLine(baseConnector, joinPoint, linePaint);
+    } else {
+      double midY = childConnectorY - stubLength;
+      canvas.drawLine(baseConnector, Offset(baseConnector.dx, midY), linePaint);
+      canvas.drawLine(
+          Offset(baseConnector.dx, midY), Offset(joinX, midY), linePaint);
+      canvas.drawLine(Offset(joinX, midY), joinPoint, linePaint);
+    }
+    canvas.drawLine(Offset(leftX, childConnectorY),
+        Offset(rightX, childConnectorY), linePaint);
+    for (var child in member.children) {
+      final childPos = positions[child]!;
+      final Offset avatarTop = Offset(childPos.dx, childPos.dy - nodeRadius);
+      canvas.drawLine(
+          Offset(childPos.dx, childConnectorY), avatarTop, linePaint);
+    }
   }
 
   void _drawConnectors(Canvas canvas, FamilyMember member,
       {Offset? connectorOrigin}) {
     final Offset nodeOrigin = connectorOrigin ?? positions[member]!;
-
-    // Draw spouse connectors.
     if (member.spouses.isNotEmpty) {
       for (int i = 0; i < member.spouses.length; i++) {
         final spouse = member.spouses[i];
@@ -825,8 +1092,6 @@ class FamilyTreePainter extends CustomPainter {
         }
       }
     }
-
-    // Draw children connectors.
     if (member.children.isNotEmpty) {
       final Offset baseConnector;
       if (connectorOrigin == null &&
@@ -879,26 +1144,19 @@ class FamilyTreePainter extends CustomPainter {
     }
   }
 
-  void _drawNodes(Canvas canvas, FamilyMember member) {
+  void _drawNodes(
+      Canvas canvas, FamilyMember member, Set<FamilyMember> visited) {
+    if (visited.contains(member)) return;
+    visited.add(member);
     final Offset? pos = positions[member];
     if (pos == null) return;
     _drawAvatar(
         canvas, pos, member.name, member == selectedMember, member.gender);
-    if (member.spouses.isNotEmpty) {
-      for (var spouse in member.spouses) {
-        if (spouse.children.isNotEmpty) {
-          _drawNodes(canvas, spouse);
-        } else {
-          final spousePos = positions[spouse];
-          if (spousePos != null) {
-            _drawAvatar(canvas, spousePos, spouse.name,
-                spouse == selectedMember, spouse.gender);
-          }
-        }
-      }
+    for (var spouse in member.spouses) {
+      _drawNodes(canvas, spouse, visited);
     }
     for (var child in member.children) {
-      _drawNodes(canvas, child);
+      _drawNodes(canvas, child, visited);
     }
   }
 
@@ -997,7 +1255,7 @@ class FamilyTreePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant FamilyTreePainter oldDelegate) {
-    return oldDelegate.positions != positions ||
-        oldDelegate.selectedMember != selectedMember;
+    // Always repaint so that changes in the mutable maps are visible immediately.
+    return true;
   }
 }
